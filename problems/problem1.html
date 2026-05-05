@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>CPSC 487/587</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/10.3.0/math.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/quaternion@1.5.1/quaternion.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/numeric@1.2.6/numeric-1.2.6.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+              "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+              "three/": "https://unpkg.com/three@0.160.0/"
+            }
+        }
+    </script>
+</head>
+<body>
+<script type="module">
+  
+    import {get_default_lil_gui, ThreeEngine, refresh_displays} from "../js/utils/utils_three.js";
+    import {XArm7Robot} from "../js/utils/utils_robot.js";
+    import {optimization_solve} from "../js/utils/utils_optimization.js";
+    import {TransformGizmoEngine} from "../js/utils/utils_transform_gizmo.js";
+
+    let engine = ThreeEngine.new_default_3d();
+    let robot = new XArm7Robot();
+    robot.spawn_robot(engine);
+
+    // set up gizmos
+    let gizmo_engine = new TransformGizmoEngine(engine);
+
+    // Gizmo 1, target pos
+    let target_gizmo_idx = gizmo_engine.add_gizmo_SO3_matrix_and_position(
+        engine,
+        [[1,0,0],[0,1,0],[0,0,1]],
+        [[0.4],[0.2],[0.5]], 
+        0.75 
+    );
+
+    // Gizmo 2, avoid pos
+    let obstacle_gizmo_idx = gizmo_engine.add_gizmo_SO3_matrix_and_position(
+        engine,
+        [[1,0,0],[0,1,0],[0,0,1]],
+        [[0.2],[0.2],[0.3]],
+        0.75
+    );
+
+    const OBSTACLE_RADIUS = 0.1;
+
+    
+    function axis_angle_to_matrix(axis, theta) {
+        let [x, y, z] = axis;
+        let c = Math.cos(theta), s = Math.sin(theta), t = 1 - c;
+        return [
+            [t*x*x+c, t*x*y-s*z, t*x*z+s*y],
+            [t*x*y+s*z, t*y*y+c, t*y*z-s*x],
+            [t*x*z-s*y, t*y*z+s*x, t*z*z+c]
+        ];
+    }
+
+    //FK function
+    function compute_fk(state, robot) {
+        let link_transforms = new Array(robot.links.length).fill(null);
+        link_transforms[0] = math.identity(4).toArray();
+
+        for (let level of robot.kinematic_hierarchy) {
+            for (let link_idx of level) {
+                let link = robot.links[link_idx];
+                if (link.parent_joint_idx === null || link.parent_joint_idx === undefined) continue;
+
+                let joint = robot.joints[link.parent_joint_idx];
+                let parent_T = link_transforms[link.parent_link_idx];
+                let Tc = joint.xyz_rpy_SE3_matrix;
+                let Tv = math.identity(4).toArray();
+
+                if (joint.joint_type_string === 'revolute') {
+                    let R = axis_angle_to_matrix(joint.axis, state[joint.dof_idx] ?? 0);
+                    Tv = [
+                        [R[0][0], R[0][1], R[0][2], 0],
+                        [R[1][0], R[1][1], R[1][2], 0],
+                        [R[2][0], R[2][1], R[2][2], 0],
+                        [0, 0, 0, 1]
+                    ];
+                }
+                if (joint.joint_type_string === 'prismatic') {
+                    let d = state[joint.dof_idx] ?? 0;
+                    let a = joint.axis;
+                    Tv = [[1,0,0,a[0]*d],[0,1,0,a[1]*d],[0,0,1,a[2]*d],[0,0,0,1]];
+                }
+
+                link_transforms[link_idx] = math.multiply(parent_T, math.multiply(Tc, Tv));
+            }
+        }
+        return link_transforms;
+    }
+
+    // index of end effector link
+    let ee_idx = robot.links.length - 1;
+
+    //State
+    let state = new Array(8).fill(0);
+
+    //animation loop
+    engine.animation_loop(() => {
+        // Read target position from gizmo SE3 matrix
+        let T_target   = gizmo_engine.get_gizmo_pose_as_SE3_matrix(target_gizmo_idx);
+        let T_obstacle = gizmo_engine.get_gizmo_pose_as_SE3_matrix(obstacle_gizmo_idx);
+
+        let target   = [T_target[0][3], T_target[1][3],   T_target[2][3]];
+        let obstacle = [T_obstacle[0][3], T_obstacle[1][3], T_obstacle[2][3]];
+
+        // draw obstacle sphere 
+        engine.draw_debug_sphere(obstacle, OBSTACLE_RADIUS, 0xff8800, 0.35);
+
+
+        // Draw target sphere
+        engine.draw_debug_sphere(target, 0.05, 0xff3333, 0.8);
+
+        // Objective function
+        let f = (x) => {
+            let transforms = compute_fk(x, robot);
+
+            // Goal 1: end-effector reaches target
+            let T_ee = transforms[ee_idx];
+            let ee_pos = [T_ee[0][3], T_ee[1][3], T_ee[2][3]];
+            let d1x = ee_pos[0] - target[0];
+            let d1y = ee_pos[1] - target[1];
+            let d1z = ee_pos[2] - target[2];
+            let cost1 = d1x*d1x + d1y*d1y + d1z*d1z;
+
+            // Goal 2: end-effector avoids obstacle object
+            let cost_obstacle = 0;
+            for (let i = 0; i < robot.links.length; i++) {
+                if (!transforms[i]) continue;
+                let T = transforms[i];
+                let lx = T[0][3] - obstacle[0];
+                let ly = T[1][3] - obstacle[1];
+                let lz = T[2][3] - obstacle[2];
+                let dist = Math.sqrt(lx*lx +  ly*ly +lz*lz);
+                let penetration = OBSTACLE_RADIUS - dist;
+                if (penetration > 0) cost_obstacle += penetration * penetration;
+            }
+
+            // Goal 3: regularization, 
+            let cost_reg = x.reduce((s, v) => s + 0.01* v * v, 0);
+
+            return cost1 + 2.0 * cost_obstacle + cost_reg;
+        };
+
+        // optimize
+        let result = optimization_solve(f, state, 100, 'bfgs');
+        state = result;
+
+        // apply fk and move joinets
+        let link_transforms = compute_fk(state, robot);
+        for (let i = 0; i < robot.links.length; i++) {
+            if (link_transforms[i]) {
+                robot.set_link_mesh_pose_from_SE3_matrix(engine, i, link_transforms[i]);
+            }
+        }
+    });
+
+</script>
+</body>
+</html>
