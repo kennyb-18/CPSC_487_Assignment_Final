@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>CPSC 487/587</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/10.3.0/math.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/quaternion@1.5.1/quaternion.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/numeric@1.2.6/numeric-1.2.6.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+              "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+              "three/": "https://unpkg.com/three@0.160.0/"
+            }
+        }
+    </script>
+</head>
+<body>
+<script type="module">
+
+    import {get_default_lil_gui, ThreeEngine, refresh_displays} from "../js/utils/utils_three.js";
+    import {XArm7Robot} from "../js/utils/utils_robot.js";
+    import {optimization_solve} from "../js/utils/utils_optimization.js";
+
+    let engine = ThreeEngine.new_default_3d();
+    let robot = new XArm7Robot();
+    robot.spawn_robot(engine);
+
+    function vec_sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+    function vec_dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+    function vec_len(a)    { return Math.sqrt(vec_dot(a, a)); }
+
+    function axis_angle_to_matrix(axis, theta) {
+        let [x, y, z] = axis;
+        let c = Math.cos(theta), s = Math.sin(theta), t = 1 - c;
+        return [
+            [t*x*x+c,   t*x*y-s*z, t*x*z+s*y],
+            [t*x*y+s*z, t*y*y+c,   t*y*z-s*x],
+            [t*x*z-s*y, t*y*z+s*x, t*z*z+c  ]
+        ];
+    }
+
+    function compute_fk(state, robot) {
+        let link_transforms = new Array(robot.links.length).fill(null);
+        link_transforms[0] = math.identity(4).toArray();
+        for (let level of robot.kinematic_hierarchy) {
+            for (let link_idx of level) {
+                let link = robot.links[link_idx];
+                if (link.parent_joint_idx === null || link.parent_joint_idx === undefined) continue;
+                let joint = robot.joints[link.parent_joint_idx];
+                let parent_T = link_transforms[link.parent_link_idx];
+                let Tc = joint.xyz_rpy_SE3_matrix;
+                let Tv = math.identity(4).toArray();
+                if (joint.joint_type_string === 'revolute') {
+                    let R = axis_angle_to_matrix(joint.axis, state[joint.dof_idx] ?? 0);
+                    Tv = [
+                        [R[0][0], R[0][1], R[0][2], 0],
+                        [R[1][0], R[1][1], R[1][2], 0],
+                        [R[2][0], R[2][1], R[2][2], 0],
+                        [0, 0, 0, 1]
+                    ];
+                }
+                if (joint.joint_type_string === 'prismatic') {
+                    let d = state[joint.dof_idx] ?? 0;
+                    let a = joint.axis;
+                    Tv = [[1,0,0,a[0]*d],[0,1,0,a[1]*d],[0,0,1,a[2]*d],[0,0,0,1]];
+                }
+                link_transforms[link_idx] = math.multiply(parent_T, math.multiply(Tc, Tv));
+            }
+        }
+        return link_transforms;
+    }
+
+    let state = new Array(8).fill(0);
+    let ee_idx = robot.links.length - 1;
+
+    function get_ee_position(transforms) {
+        let T = transforms[ee_idx];
+        return [T[0][3], T[1][3], T[2][3]];
+    }
+
+    const BELT1_START    = [0.4,   0.8, 0.15];
+    const BELT1_END      = [0.4,  -0.2, 0.15];
+    const BELT1_PICKUP_Y = 0.6;
+
+    const BELT2_START    = [-0.4, -0.2, 0.15];
+    const BELT2_END      = [-0.4,  0.8, 0.15];
+    const BELT2_PICKUP_Y = 0.3;
+
+    const BELT_SPEED     = 0.1;
+    const SPHERE_SPACING = 0.25;
+    const GRAB_THRESHOLD = 0.07;
+    const DROP_THRESHOLD = 0.1;
+    const HOME_POSITION  = [0.2, 0.3, 0.4];
+    const DROP_ZONE      = [0.0, 0.45, 0.2];
+
+    const COLOR_PICKUP  = 0xf02b16;
+    const COLOR_IGNORE  = 0x32a852;
+    const COLOR_CARRIED = 0xff8800;
+
+    function make_sphere(start_pos) {
+        return { pos: [...start_pos], active: true, ignore: Math.random() < 0.3 };
+    }
+    // make a list for all our sphere objects
+    let spheres1 = [];
+    let spheres2 = [];
+    for (let i = 0; i < 5; i++) {
+        spheres1.push(make_sphere([BELT1_START[0], BELT1_START[1] - i * SPHERE_SPACING, BELT1_START[2]]));
+        spheres2.push(make_sphere([BELT2_START[0], BELT2_START[1] + i * SPHERE_SPACING, BELT2_START[2]]));
+    }
+
+    function add_sphere_to_belt(belt) {
+        if (belt === 1) spheres1.push(make_sphere(BELT1_START));
+        else            spheres2.push(make_sphere(BELT2_START));
+    }
+
+    let STATE = 'WAITING';
+    let active_belt = null;
+    let carried_pos = null;
+    // store reference to target sphere
+    let target_sphere_ref = null;
+
+    engine.animation_loop(() => {
+        let dt = Math.min(engine.get_delta_time_from_last_frame(), 0.05);
+
+        // move belt 1
+        for (let s of spheres1) {
+            if (!s.active) continue;
+            s.pos[1] -= BELT_SPEED * dt;
+            if (s.pos[1] < BELT1_END[1]) {
+                s.pos[0] = BELT1_START[0];
+                s.pos[1] = BELT1_START[1];
+                s.pos[2] = BELT1_START[2];
+                s.ignore = Math.random() < 0.3;
+            }
+        }
+
+        // move belt 2
+        for (let s of spheres2) {
+            if (!s.active) continue;
+            s.pos[1] += BELT_SPEED * dt;
+            if (s.pos[1] > BELT2_END[1]) {
+                s.pos[0] = BELT2_START[0];
+                s.pos[1] = BELT2_START[1];
+                s.pos[2] = BELT2_START[2];
+                s.ignore = Math.random() < 0.3;
+            }
+        }
+
+        // remove inactive spheres from list
+        spheres1 = spheres1.filter(s => s.active || s === target_sphere_ref);
+        spheres2 = spheres2.filter(s => s.active || s === target_sphere_ref);
+
+        let ik_target = HOME_POSITION;
+        // state machine
+        if (STATE === 'WAITING') {
+            ik_target = HOME_POSITION;
+            target_sphere_ref = null;
+
+            for (let s of spheres1) {
+                if (s.active && !s.ignore && s.pos[1] <= BELT1_PICKUP_Y) {
+                    target_sphere_ref = s;
+                    active_belt = 1;
+                    STATE = 'GRABBING';
+                    break;
+                }
+            }
+            if (STATE === 'WAITING') {
+                for (let s of spheres2) {
+                    if (s.active && !s.ignore && s.pos[1] >= BELT2_PICKUP_Y) {
+                        target_sphere_ref = s;
+                        active_belt = 2;
+                        STATE = 'GRABBING';
+                        break;
+                    }
+                }
+            }
+        }
+
+        else if (STATE === 'GRABBING') {
+            // stop if sphere too far
+            let rolled_off = active_belt === 1 ? target_sphere_ref.pos[1] < BELT1_END[1] + 0.05: target_sphere_ref.pos[1] > BELT2_END[1] - 0.05;
+
+            if (!target_sphere_ref || !target_sphere_ref.active || rolled_off) {
+                target_sphere_ref = null;
+                STATE = 'WAITING';
+            } else {
+                ik_target = [...target_sphere_ref.pos];
+                let ee = get_ee_position(compute_fk(state, robot));
+
+                if (vec_len(vec_sub(ee, target_sphere_ref.pos)) < GRAB_THRESHOLD) {
+                    carried_pos = [...target_sphere_ref.pos];
+                    target_sphere_ref.active = false;
+                    target_sphere_ref = null;
+                    add_sphere_to_belt(active_belt);
+                    STATE = 'CARRYING';
+                }
+            }
+        }
+
+        else if (STATE === 'CARRYING') {
+            ik_target = DROP_ZONE;
+            let ee = get_ee_position(compute_fk(state, robot));
+            carried_pos = [...ee];
+
+            if (vec_len(vec_sub(ee, DROP_ZONE)) < DROP_THRESHOLD) {
+                carried_pos = null;
+                STATE = 'DROPPING';
+            }
+        }
+
+        else if (STATE === 'DROPPING') {
+            ik_target = HOME_POSITION;
+            let ee = get_ee_position(compute_fk(state, robot));
+
+            if (vec_len(vec_sub(ee, HOME_POSITION)) < 0.12) {
+                STATE = 'WAITING';
+            }
+        }
+
+        // objective function
+        let f = (x) => {
+            let transforms = compute_fk(x, robot);
+            let T_ee = transforms[ee_idx];
+            if (!T_ee || !T_ee[0]) return 1e9;
+            let ee_pos = [T_ee[0][3], T_ee[1][3], T_ee[2][3]];
+            let dx = ee_pos[0] - ik_target[0];
+            let dy = ee_pos[1] - ik_target[1];
+            let dz = ee_pos[2] - ik_target[2];
+            let cost_target = dx*dx + dy*dy + dz*dz;
+            let cost_reg = 0.1 * x[0] * x[0];
+            for (let i = 1; i < x.length; i++) cost_reg += 0.001 * x[i] * x[i];
+            return cost_target + cost_reg;
+        };
+
+        let prev_state = [...state];
+        let result = optimization_solve(f, state, 50, 'bfgs');
+
+        let valid = result.every(v => isFinite(v) && Math.abs(v) < 20);
+        if (!valid) result = prev_state;
+
+        let alpha = 0.25;
+        for (let i = 0; i < state.length; i++) {
+            state[i] = state[i] + alpha * (result[i] - state[i]);
+        }
+        state[0] = Math.max(0, Math.min(0.5, state[0]));
+        if (!state.every(v => isFinite(v) && Math.abs(v) < 20)) state = new Array(8).fill(0);
+
+        // renfer robot
+        let link_transforms = compute_fk(state, robot);
+        for (let i = 0; i < robot.links.length; i++) {
+            if (link_transforms[i]) robot.set_link_mesh_pose_from_SE3_matrix(engine, i, link_transforms[i]);
+        }
+
+        // Draw all the spheres
+        for (let s of spheres1) {
+            if (s.active) engine.draw_debug_sphere(s.pos, 0.04, s.ignore ? COLOR_IGNORE : COLOR_PICKUP, 1.0);
+        }
+        for (let s of spheres2) {
+            if (s.active) engine.draw_debug_sphere(s.pos, 0.04, s.ignore ? COLOR_IGNORE : COLOR_PICKUP, 1.0);
+        }
+        if (carried_pos) engine.draw_debug_sphere(carried_pos, 0.04, COLOR_CARRIED, 1.0);
+
+        // Draw belt paths
+        engine.draw_debug_line(BELT1_START, BELT1_END, false, 0.005, 0x888888);
+        engine.draw_debug_line(BELT2_START, BELT2_END, false, 0.005, 0x888888);
+
+        // draw drop bin
+        let b = DROP_ZONE;
+        let r = 0.08;
+        engine.draw_debug_line([b[0]-r, b[1]-r, b[2]], [b[0]+r, b[1]-r, b[2]], false, 0.005, 0x00ff00);
+        engine.draw_debug_line([b[0]+r, b[1]-r, b[2]], [b[0]+r, b[1]+r, b[2]], false, 0.005, 0x00ff00);
+        engine.draw_debug_line([b[0]+r, b[1]+r, b[2]], [b[0]-r, b[1]+r, b[2]], false, 0.005, 0x00ff00);
+        engine.draw_debug_line([b[0]-r, b[1]+r, b[2]], [b[0]-r, b[1]-r, b[2]], false, 0.005, 0x00ff00);
+    });
+
+</script>
+</body>
+</html>
